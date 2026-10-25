@@ -1,0 +1,563 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@using System.Globalization
+@using JavaBlueprints.Models
+@using JavaBlueprints.Services
+@inject JavaBlueprintSyncService SyncService
+@inject StaticAnalysisAndBigOService AnalyzerService
+@inject MonolithOptimizerService OptimizerService
+@inject JavaQualityGateService QualityGateService
+
+<PageTitle>Java Blueprints — Визуальная среда программирования</PageTitle>
+
+<div class="jb-shell">
+    <!-- ================= ВЕРХНИЙ ТУЛБАР (Слайд 4) ================= -->
+    <header class="jb-topbar">
+        <div class="jb-brand">
+            <span class="jb-logo-badge">⬡</span>
+            <strong>Визуальная среда программирования</strong>
+            <span class="jb-tag">Java Blueprints MVP</span>
+        </div>
+
+        <div class="jb-actions">
+            <button class="jb-btn" @onclick="LoadDemoMonolith" title="Сбросить к исходному монолиту">
+                📥 Импорт Java (Монолит)
+            </button>
+            <button class="jb-btn jb-btn-accent" @onclick="ApplyAutoOptimization" title="Заменить вложенный цикл O(n²) на индексацию через Map O(n)">
+                ✨ Оптимизировать Big O
+            </button>
+            <button class="jb-btn" @onclick="ApplyMonolithDecomposition" title="Выделить Parser.java, Analyzer.java, Optimizer.java (Слайд 6)">
+                🧩 Декомпозировать монолит
+            </button>
+            <button class="jb-btn jb-btn-success" @onclick="RunAndCompareBehaviorAsync" disabled="@_isRunningTests">
+                @(_isRunningTests ? "⏳ Проверка..." : "▶ Запустить и сравнить (Quality Gate)")
+            </button>
+        </div>
+    </header>
+
+    <!-- ================= ОСНОВНАЯ СЕТКА ИЗ 3 КОЛОНОК (Слайд 4) ================= -->
+    <div class="jb-workspace">
+
+        <!-- 1. ЛЕВАЯ ПАНЕЛЬ: Дерево файлов проекта + Палитра блоков -->
+        <aside class="jb-sidebar-left">
+            <div class="jb-panel-header">📁 Проект (@_projectFiles.Count файлов)</div>
+            <div class="jb-file-tree">
+                <div class="jb-folder">▾ src / com.example</div>
+                @foreach (var file in _projectFiles)
+                {
+                    <div class="jb-file-item @(file.FileName == _activeFileName ? "active" : "")"
+                         @onclick="() => SelectProjectFile(file)">
+                        <span>☕ @file.FileName</span>
+                        <small class="jb-file-role">@file.Responsibility</small>
+                    </div>
+                }
+            </div>
+
+            <div class="jb-panel-header" style="margin-top:12px;">🧱 Палитра блоков (Добавить в граф)</div>
+            <div class="jb-palette">
+                <button class="jb-palette-btn kind-variable" @onclick="() => AppendBlockFromPalette(NodeKind.Variable)">
+                    <span>x=</span> Переменная
+                </button>
+                <button class="jb-palette-btn kind-condition" @onclick="() => AppendBlockFromPalette(NodeKind.Condition)">
+                    <span>◇</span> Условие (if/else)
+                </button>
+                <button class="jb-palette-btn kind-loop" @onclick="() => AppendBlockFromPalette(NodeKind.Loop)">
+                    <span>↻</span> Цикл (for/while)
+                </button>
+                <button class="jb-palette-btn kind-operation" @onclick="() => AppendBlockFromPalette(NodeKind.Operation)">
+                    <span>⚙</span> Операция
+                </button>
+                <button class="jb-palette-btn kind-return" @onclick="() => AppendBlockFromPalette(NodeKind.Return)">
+                    <span>⇥</span> Возврат (return)
+                </button>
+            </div>
+        </aside>
+
+        <!-- 2. ЦЕНТРАЛЬНАЯ ПАНЕЛЬ: Визуальный граф сверху + Код / Консоль / Тесты снизу -->
+        <main class="jb-center">
+            <!-- ВЕРХНЯЯ ЧАСТЬ: Визуальный канвас блок-схемы -->
+            <div class="jb-canvas-header">
+                <span>🔗 Граф потока управления: <strong>@_activeFileName</strong> (узлов: @_currentGraph.Nodes.Count, ребер: @_currentGraph.Edges.Count)</span>
+                <span class="jb-sync-hint">🔄 Двусторонняя синхронизация Java ↔ Граф активна</span>
+            </div>
+
+            <div class="jb-canvas-viewport">
+                @{
+                    double canvasHeight = Math.Max(600, (_currentGraph.Nodes.LastOrDefault()?.Y ?? 400) + 160);
+                    double canvasWidth = Math.Max(960, (_currentGraph.Nodes.Any() ? _currentGraph.Nodes.Max(n => n.X) : 400) + 580);
+                }
+                <div class="jb-canvas-stage" style="width:@(F(canvasWidth))px; height:@(F(canvasHeight))px;">
+
+                    <!-- УЗЛЫ ГРАФА -->
+                    @foreach (var node in _currentGraph.Nodes)
+                    {
+                        bool hasWarning = node.AttachedDiagnostics.Any();
+                        bool isSelected = _selectedNode?.Id == node.Id;
+                        <div class="jb-node @GetNodeCssClass(node.Kind) @(hasWarning ? "jb-node-warn" : "") @(isSelected ? "jb-node-selected" : "")"
+                             style="left:@(F(node.X))px; top:@(F(node.Y))px;"
+                             @onclick="() => SelectNode(node)">
+
+                            <div class="jb-node-header">
+                                <span class="jb-node-kind">@node.Title</span>
+                                <span class="jb-node-branch">Ветка: @node.BranchTag | Стр. @node.SourceLine</span>
+                                @if (hasWarning)
+                                {
+                                    <span class="jb-warn-icon" title="@node.AttachedDiagnostics[0].Title">
+                                        ⚠️ @node.AttachedDiagnostics[0].ComplexityBadge
+                                    </span>
+                                }
+                                @if (node.Kind != NodeKind.Method)
+                                {
+                                    <button class="jb-node-del" @onclick:stopPropagation="true" @onclick="() => DeleteNodeFromGraph(node)" title="Удалить узел и пересобрать Java">✕</button>
+                                }
+                            </div>
+
+                            <div class="jb-node-body">
+                                <input class="jb-node-input"
+                                       value="@node.CodeSnippet"
+                                       @onchange="(e) => OnNodeCodeEdited(node, e.Value?.ToString() ?? string.Empty)" />
+                            </div>
+                        </div>
+                    }
+
+                    <!-- [ЗАДАЧА 3]: SVG-СЛОЙ СТРЕЛОК И СВЯЗЕЙ ПОВЕРХ КОНТЕЙНЕРА С БЛОКАМИ -->
+                    <svg style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2;">
+                        <defs>
+                            <marker id="arrow-flow" viewBox="0 0 10 10" refX="8" refY="5"
+                                    markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8" />
+                            </marker>
+                            <marker id="arrow-no" viewBox="0 0 10 10" refX="8" refY="5"
+                                    markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b" />
+                            </marker>
+                            <marker id="arrow-back" viewBox="0 0 10 10" refX="8" refY="5"
+                                    markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                                <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7" />
+                            </marker>
+                        </defs>
+
+                        @foreach (var edge in _currentGraph.Edges)
+                        {
+                            var fromNode = _currentGraph.Nodes.FirstOrDefault(n => n.Id == edge.FromNodeId);
+                            var toNode = _currentGraph.Nodes.FirstOrDefault(n => n.Id == edge.ToNodeId);
+
+                            if (fromNode != null && toNode != null)
+                            {
+                                const double nodeWidth = 480;
+                                const double nodeHeight = 72;
+
+                                if (edge.IsBackEdge)
+                                {
+                                    // Обратная дуга цикла справа от блоков
+                                    double startX = fromNode.X + nodeWidth;
+                                    double startY = fromNode.Y + (nodeHeight / 2);
+                                    double endX = toNode.X + nodeWidth;
+                                    double endY = toNode.Y + (nodeHeight / 2);
+                                    double curveX = Math.Max(startX, endX) + 54;
+
+                                    string backPath = $"M {F(startX)} {F(startY)} C {F(curveX)} {F(startY)}, {F(curveX)} {F(endY)}, {F(endX)} {F(endY)}";
+                                    double labelY = (startY + endY) / 2;
+
+                                    <path d="@backPath"
+                                          fill="none"
+                                          stroke="#a855f7"
+                                          stroke-width="2"
+                                          stroke-dasharray="5,4"
+                                          marker-end="url(#arrow-back)" />
+
+                                    if (!string.IsNullOrEmpty(edge.Label))
+                                    {
+                                        @:<text x="@F(curveX - 6)" y="@F(labelY)" fill="#c084fc" font-size="11" font-weight="600" text-anchor="end">@edge.Label</text>
+                                    }
+                                }
+                                else
+                                {
+                                    // Прямая или ступенчатая стрелка сверху вниз между узлами
+                                    double x1 = fromNode.X + 44;
+                                    double y1 = fromNode.Y + nodeHeight;
+                                    double x2 = toNode.X + 44;
+                                    double y2 = toNode.Y - 2;
+
+                                    bool isNoBranch = edge.Label == "Нет";
+                                    string strokeColor = isNoBranch ? "#f59e0b" : "#38bdf8";
+                                    string markerUrl = isNoBranch ? "url(#arrow-no)" : "url(#arrow-flow)";
+
+                                    if (Math.Abs(x1 - x2) < 2)
+                                    {
+                                        <line x1="@F(x1)" y1="@F(y1)"
+                                              x2="@F(x2)" y2="@F(y2)"
+                                              stroke="@strokeColor"
+                                              stroke-width="2"
+                                              marker-end="@markerUrl" />
+                                    }
+                                    else
+                                    {
+                                        double midY = (y1 + y2) / 2;
+                                        string stepPath = $"M {F(x1)} {F(y1)} C {F(x1)} {F(midY)}, {F(x2)} {F(midY)}, {F(x2)} {F(y2)}";
+                                        <path d="@stepPath"
+                                              fill="none"
+                                              stroke="@strokeColor"
+                                              stroke-width="2"
+                                              marker-end="@markerUrl" />
+                                    }
+
+                                    if (!string.IsNullOrEmpty(edge.Label))
+                                    {
+                                        double textX = ((x1 + x2) / 2) + 8;
+                                        double textY = ((y1 + y2) / 2) + 3;
+                                        @:<text x="@F(textX)" y="@F(textY)" fill="@strokeColor" font-size="11" font-weight="700">@edge.Label</text>
+                                    }
+                                }
+                            }
+                        }
+                    </svg>
+                </div>
+            </div>
+
+            <!-- НИЖНЯЯ ЧАСТЬ: Вкладки Код Java | Консоль | Результат тестов (Слайд 4) -->
+            <div class="jb-bottom-pane">
+                <div class="jb-tabs">
+                    <button class="jb-tab @(_bottomTab == "code" ? "active" : "")" @onclick='() => _bottomTab = "code"'>
+                        📝 Код Java (редактируемый)
+                    </button>
+                    <button class="jb-tab @(_bottomTab == "console" ? "active" : "")" @onclick='() => _bottomTab = "console"'>
+                        🖥 Консоль (@_lastGateReport.ConsoleLogs.Count)
+                    </button>
+                    <button class="jb-tab @(_bottomTab == "tests" ? "active" : "")" @onclick='() => _bottomTab = "tests"'>
+                        ✅ Результат тестов (@_lastGateReport.PassedCount/@_lastGateReport.TotalCount)
+                    </button>
+                </div>
+
+                <div class="jb-tab-content">
+                    @if (_bottomTab == "code")
+                    {
+                        <div class="jb-code-editor-wrap">
+                            <textarea class="jb-code-textarea"
+                                      value="@_javaSourceCode"
+                                      @oninput="OnJavaTextEdited"></textarea>
+                        </div>
+                    }
+                    else if (_bottomTab == "console")
+                    {
+                        <div class="jb-console-box">
+                            @foreach (var log in _lastGateReport.ConsoleLogs)
+                            {
+                                <div class="jb-console-line @(log.Contains("✓") ? "log-ok" : "")">@log</div>
+                            }
+                        </div>
+                    }
+                    else if (_bottomTab == "tests")
+                    {
+                        <div class="jb-tests-box">
+                            <div class="jb-tests-summary @(_lastGateReport.AllBehaviorPreserved ? "ok" : "fail")">
+                                <strong>
+                                    @(_lastGateReport.AllBehaviorPreserved
+                                        ? $"Все тесты пройдены ({_lastGateReport.PassedCount} из {_lastGateReport.TotalCount}) — Поведение программы сохранено ✓"
+                                        : "Обнаружены расхождения или тесты еще не запускались")
+                                </strong>
+                                <span>Реальное ускорение на большом наборе: <strong>@(_lastGateReport.ActualSpeedupFactor)x</strong></span>
+                            </div>
+
+                            <table class="jb-tests-table">
+                                <thead>
+                                    <tr>
+                                        <th>Тест</th>
+                                        <th>Сценарий</th>
+                                        <th>Эталон (мс)</th>
+                                        <th>После правок (мс)</th>
+                                        <th>Статус поведения</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var t in _lastGateReport.TestResults)
+                                    {
+                                        <tr>
+                                            <td><code>@t.TestName</code></td>
+                                            <td>@t.InputDescription</td>
+                                            <td>@t.BaselineTimeMs мс</td>
+                                            <td><strong>@t.CandidateTimeMs мс</strong></td>
+                                            <td>
+                                                <span class="jb-badge @(t.BehaviorMatches ? "badge-ok" : "badge-err")">
+                                                    @(t.BehaviorMatches ? "Успешно (совпадает)" : "Расхождение!")
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                </div>
+            </div>
+        </main>
+
+        <!-- 3. ПРАВАЯ ПАНЕЛЬ: Анализ, Диагностика дефектов и Big O (Слайды 4 и 5) -->
+        <aside class="jb-sidebar-right">
+            <div class="jb-panel-header">🔍 Анализ и диагностика Big O</div>
+
+            <!-- Карточка оценки сложности (Слайд 4 справа внизу) -->
+            <div class="jb-complexity-card">
+                <div class="jb-complexity-row">
+                    <span>Текущая сложность:</span>
+                    <strong class="jb-bigo-current">@_complexity.CurrentBigO</strong>
+                    <span>→ После оптимизации:</span>
+                    <strong class="jb-bigo-target">@_complexity.OptimizedBigO</strong>
+                </div>
+                <div class="jb-speedup-row">
+                    <span>Ожидаемое ускорение:</span>
+                    <span class="jb-speedup-pill">@_complexity.ExpectedSpeedup</span>
+                </div>
+                <div class="jb-metrics-mini">
+                    <span>Строк: @_complexity.TotalLines</span>
+                    <span>Вложенность циклов: @_complexity.MaxLoopNesting</span>
+                    <span>Цикломатика: @_complexity.CyclomaticComplexity</span>
+                </div>
+            </div>
+
+            <div class="jb-panel-subheader">
+                Найдено проблем: @_diagnostics.Count
+            </div>
+
+            <div class="jb-diagnostics-list">
+                @foreach (var diag in _diagnostics)
+                {
+                    <div class="jb-diag-card sev-@diag.Severity.ToString().ToLower()"
+                         @onclick="() => FocusNodeById(diag.TargetNodeId)">
+                        <div class="jb-diag-top">
+                            <strong>@diag.Title</strong>
+                            <span class="jb-diag-loc">@diag.FileName:@diag.LineNumber</span>
+                        </div>
+                        <div class="jb-diag-item"><strong>Дефект:</strong> @diag.DefectDescription</div>
+                        <div class="jb-diag-item"><strong>Риск:</strong> @diag.RiskDescription</div>
+                        <div class="jb-diag-item"><strong>Рекомендация:</strong> @diag.Recommendation</div>
+                        <div class="jb-diag-effect">⚡ @diag.ExpectedEffect</div>
+                    </div>
+                }
+            </div>
+        </aside>
+    </div>
+</div>
+
+<style>
+    /* Стилизация в темной теме концепта Axenix (Слайд 4) */
+    .jb-shell { display:flex; flex-direction:column; height:100vh; background:#0f141c; color:#e2e8f0; font-family:'Segoe UI',sans-serif; font-size:13px; }
+    .jb-topbar { display:flex; justify-content:space-between; align-items:center; padding:8px 16px; background:#161d2a; border-bottom:1px solid #263248; }
+    .jb-brand { display:flex; align-items:center; gap:10px; font-size:15px; }
+    .jb-logo-badge { background:#ff6b2b; color:#fff; padding:2px 7px; border-radius:6px; font-weight:bold; }
+    .jb-tag { background:#233047; color:#94a3b8; font-size:11px; padding:2px 8px; border-radius:4px; }
+    .jb-actions { display:flex; gap:8px; }
+    .jb-btn { background:#1e293b; color:#e2e8f0; border:1px solid #334155; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; }
+    .jb-btn:hover { background:#334155; }
+    .jb-btn-accent { background:#6366f1; border-color:#818cf8; color:#fff; font-weight:600; }
+    .jb-btn-success { background:#10b981; border-color:#34d399; color:#052e16; font-weight:700; }
+
+    .jb-workspace { display:grid; grid-template-columns:240px 1fr 340px; flex:1; overflow:hidden; }
+    .jb-sidebar-left, .jb-sidebar-right { background:#131a26; border-right:1px solid #232f46; display:flex; flex-direction:column; padding:10px; overflow-y:auto; }
+    .jb-sidebar-right { border-right:none; border-left:1px solid #232f46; }
+    .jb-panel-header { font-weight:700; color:#94a3b8; text-transform:uppercase; font-size:11px; margin-bottom:8px; letter-spacing:0.5px; }
+    .jb-file-item { display:flex; flex-direction:column; padding:6px 8px; border-radius:6px; cursor:pointer; margin-bottom:4px; }
+    .jb-file-item.active { background:#1e293b; border-left:3px solid #ff6b2b; }
+    .jb-file-role { color:#64748b; font-size:10px; }
+
+    .jb-palette { display:flex; flex-direction:column; gap:6px; }
+    .jb-palette-btn { text-align:left; padding:7px 10px; border-radius:6px; border:1px solid #2d3c56; background:#192231; color:#e2e8f0; cursor:pointer; }
+    .jb-center { display:flex; flex-direction:column; overflow:hidden; }
+    .jb-canvas-header { display:flex; justify-content:space-between; padding:8px 14px; background:#141c29; border-bottom:1px solid #222e42; font-size:12px; }
+    .jb-sync-hint { color:#38bdf8; font-size:11px; }
+    .jb-canvas-viewport { flex:1; overflow:auto; position:relative; background:radial-gradient(#233047 1px, transparent 1px); background-size:18px 18px; }
+    .jb-canvas-stage { position:relative; }
+
+    .jb-node { position:absolute; width:480px; border-radius:8px; border:1px solid #334155; background:#182232; box-shadow:0 4px 10px rgba(0,0,0,0.35); z-index:1; }
+    .jb-node-warn { border:2px solid #f59e0b; }
+    .jb-node-selected { outline:2px solid #38bdf8; }
+    .jb-node-header { display:flex; justify-content:space-between; align-items:center; padding:5px 10px; border-radius:7px 7px 0 0; font-size:11px; font-weight:600; }
+    .kind-method .jb-node-header { background:#4f46e5; color:#fff; }
+    .kind-variable .jb-node-header { background:#0284c7; color:#fff; }
+    .kind-condition .jb-node-header { background:#d97706; color:#fff; }
+    .kind-loop .jb-node-header { background:#7c3aed; color:#fff; }
+    .kind-operation .jb-node-header, .kind-externalcall .jb-node-header { background:#0d9488; color:#fff; }
+    .kind-trycatch .jb-node-header { background:#be123c; color:#fff; }
+    .kind-return .jb-node-header { background:#16a34a; color:#fff; }
+    .jb-node-body { padding:6px 10px; }
+    .jb-node-input { width:100%; background:#0f172a; color:#f8fafc; border:1px solid #334155; border-radius:4px; padding:4px 8px; font-family:monospace; font-size:12px; }
+    .jb-warn-icon { background:#78350f; color:#fde68a; padding:1px 6px; border-radius:4px; font-size:10px; }
+    .jb-node-del { background:transparent; border:none; color:#fca5a5; cursor:pointer; }
+
+    .jb-bottom-pane { height:250px; border-top:1px solid #263248; display:flex; flex-direction:column; background:#111722; }
+    .jb-tabs { display:flex; background:#161f2e; border-bottom:1px solid #263248; }
+    .jb-tab { padding:7px 14px; background:transparent; color:#94a3b8; border:none; cursor:pointer; font-size:12px; }
+    .jb-tab.active { color:#fff; border-bottom:2px solid #ff6b2b; background:#1e293b; }
+    .jb-tab-content { flex:1; overflow:auto; padding:8px; }
+    .jb-code-textarea { width:100%; height:190px; background:#0b0f17; color:#a5f3fc; border:1px solid #263248; font-family:monospace; font-size:12px; padding:8px; }
+    .jb-console-line { font-family:monospace; padding:3px 0; color:#cbd5e1; }
+    .jb-console-line.log-ok { color:#4ade80; font-weight:600; }
+    .jb-tests-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:12px; }
+    .jb-tests-table th, .jb-tests-table td { border-bottom:1px solid #233047; padding:5px 8px; text-align:left; }
+    .badge-ok { color:#4ade80; } .badge-err { color:#f87171; }
+
+    .jb-complexity-card { background:#1b2434; border:1px solid #2e3d56; border-radius:8px; padding:10px; margin-bottom:12px; }
+    .jb-bigo-current { color:#f87171; font-size:15px; margin:0 4px; }
+    .jb-bigo-target { color:#4ade80; font-size:15px; margin-left:4px; }
+    .jb-speedup-row { display:flex; justify-content:space-between; align-items:center; margin-top:6px; }
+    .jb-speedup-pill { background:#064e3b; color:#6ee7b7; padding:2px 8px; border-radius:12px; font-weight:bold; }
+    .jb-metrics-mini { display:flex; justify-content:space-between; color:#94a3b8; font-size:11px; margin-top:8px; }
+    .jb-diag-card { background:#192231; border-left:4px solid #f59e0b; border-radius:6px; padding:9px; margin-bottom:8px; cursor:pointer; }
+    .jb-diag-card.sev-high { border-left-color:#ef4444; }
+    .jb-diag-top { display:flex; justify-content:space-between; margin-bottom:4px; }
+    .jb-diag-loc { color:#94a3b8; font-family:monospace; font-size:11px; }
+    .jb-diag-item { color:#cbd5e1; font-size:11.5px; margin-bottom:3px; }
+    .jb-diag-effect { color:#38bdf8; font-size:11px; margin-top:4px; font-weight:600; }
+</style>
+
+@code {
+    private string _baselineMonolithCode = DemoMonolithProvider.DefaultMonolithJava;
+    private string _javaSourceCode = DemoMonolithProvider.DefaultMonolithJava;
+    private string _activeFileName = "Main.java";
+    private BlueprintGraph _currentGraph = new();
+    private List<CodeDiagnostic> _diagnostics = new();
+    private ComplexitySummary _complexity = new();
+    private QualityGateReport _lastGateReport = new();
+    private List<VirtualProjectFile> _projectFiles = new();
+    private BlueprintNode? _selectedNode;
+    private string _bottomTab = "code";
+    private bool _isRunningTests;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadDemoMonolith();
+    }
+
+    private static string F(double val) => val.ToString("0.#", CultureInfo.InvariantCulture);
+
+    private async Task LoadDemoMonolith()
+    {
+        _baselineMonolithCode = DemoMonolithProvider.DefaultMonolithJava;
+        _javaSourceCode = _baselineMonolithCode;
+        _activeFileName = "Main.java";
+        _projectFiles = new List<VirtualProjectFile>
+        {
+            new() { FileName = "Main.java", Responsibility = "Монолит (парсинг + анализ + O(n²) + вывод)", SourceCode = _javaSourceCode }
+        };
+        RebuildGraphAndAnalyze();
+        await RunAndCompareBehaviorAsync();
+    }
+
+    private void RebuildGraphAndAnalyze()
+    {
+        _currentGraph = SyncService.ParseJavaToGraph(_javaSourceCode, _activeFileName);
+        (_diagnostics, _complexity) = AnalyzerService.Analyze(_currentGraph, _javaSourceCode);
+    }
+
+    private void OnNodeCodeEdited(BlueprintNode node, string newSnippet)
+    {
+        node.CodeSnippet = newSnippet;
+        _javaSourceCode = SyncService.GenerateJavaFromGraph(_currentGraph);
+        UpdateActiveProjectFile(_javaSourceCode);
+        RebuildGraphAndAnalyze();
+    }
+
+    private void DeleteNodeFromGraph(BlueprintNode node)
+    {
+        _currentGraph.Nodes.Remove(node);
+        _javaSourceCode = SyncService.GenerateJavaFromGraph(_currentGraph);
+        UpdateActiveProjectFile(_javaSourceCode);
+        RebuildGraphAndAnalyze();
+    }
+
+    private void AppendBlockFromPalette(NodeKind kind)
+    {
+        string defaultSnippet = kind switch
+        {
+            NodeKind.Variable => "int counter = 0",
+            NodeKind.Condition => "if (orders != null)",
+            NodeKind.Loop => "for (Order item : validOrders)",
+            NodeKind.Return => "return validOrders",
+            _ => "System.out.println(\"Step executed\")"
+        };
+
+        int insertIndex = _selectedNode != null ? _currentGraph.Nodes.IndexOf(_selectedNode) + 1 : _currentGraph.Nodes.Count;
+        int depth = _selectedNode != null
+            ? (_selectedNode.Kind is NodeKind.Loop or NodeKind.Condition or NodeKind.TryCatch or NodeKind.Method
+                ? _selectedNode.Depth + 1
+                : Math.Max(1, _selectedNode.Depth))
+            : 1;
+
+        _currentGraph.Nodes.Insert(insertIndex, new BlueprintNode
+        {
+            Kind = kind,
+            Title = kind.ToString(),
+            CodeSnippet = defaultSnippet,
+            Depth = depth,
+            BranchTag = "Поток"
+        });
+
+        _javaSourceCode = SyncService.GenerateJavaFromGraph(_currentGraph);
+        UpdateActiveProjectFile(_javaSourceCode);
+        RebuildGraphAndAnalyze();
+    }
+
+    private void OnJavaTextEdited(ChangeEventArgs e)
+    {
+        _javaSourceCode = e.Value?.ToString() ?? string.Empty;
+        UpdateActiveProjectFile(_javaSourceCode);
+        RebuildGraphAndAnalyze();
+    }
+
+    private async Task ApplyAutoOptimization()
+    {
+        _javaSourceCode = OptimizerService.OptimizeJavaCode(_javaSourceCode);
+        UpdateActiveProjectFile(_javaSourceCode);
+        RebuildGraphAndAnalyze();
+        await RunAndCompareBehaviorAsync();
+        _bottomTab = "tests";
+    }
+
+    private void ApplyMonolithDecomposition()
+    {
+        _projectFiles = OptimizerService.DecomposeMonolith(_javaSourceCode);
+        var mainFile = _projectFiles.First(f => f.FileName == "Main.java");
+        SelectProjectFile(mainFile);
+    }
+
+    private void SelectProjectFile(VirtualProjectFile file)
+    {
+        _activeFileName = file.FileName;
+        _javaSourceCode = file.SourceCode;
+        RebuildGraphAndAnalyze();
+    }
+
+    private void UpdateActiveProjectFile(string updatedCode)
+    {
+        var current = _projectFiles.FirstOrDefault(f => f.FileName == _activeFileName);
+        if (current != null) current.SourceCode = updatedCode;
+    }
+
+    private async Task RunAndCompareBehaviorAsync()
+    {
+        try
+        {
+            _isRunningTests = true;
+            StateHasChanged();
+            _lastGateReport = await QualityGateService.RunQualityGateAsync(_baselineMonolithCode, _javaSourceCode);
+        }
+        catch (Exception ex)
+        {
+            _lastGateReport.ConsoleLogs.Add($"[ОШИБКА СИСТЕМЫ]: {ex.Message}");
+        }
+        finally
+        {
+            _isRunningTests = false;
+            StateHasChanged();
+        }
+    }
+
+    private void SelectNode(BlueprintNode node) => _selectedNode = node;
+
+    private void FocusNodeById(string nodeId)
+    {
+        _selectedNode = _currentGraph.Nodes.FirstOrDefault(n => n.Id == nodeId);
+    }
+
+    private static string GetNodeCssClass(NodeKind kind) => $"kind-{kind.ToString().ToLower()}";
+}
